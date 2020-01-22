@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 def parse_argument():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--fix_word", default=None, type=str, required=True,
+                        help="A fixed word in text generation.")
     parser.add_argument("--bert_model", default=None, type=str, required=True,
                         help="Bert pre-trained model selected in the list: bert-base-uncased, "
                         "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
@@ -50,7 +52,7 @@ def parse_argument():
     args = parser.parse_args()
     return args
 
-def paraphrase(tokenizer, device, max_iter=10, length=50, max_length=128,
+def paraphrase(tokenizer, device, max_length=128,
              model=None, fix_word=None, samples=1):
 
     # モデルを読み込む、state_dictはパラメータを読み込む？
@@ -63,8 +65,8 @@ def paraphrase(tokenizer, device, max_iter=10, length=50, max_length=128,
     model.to(device)
 
     # 入力を分かち書き
-    generated_token_ids = tokenizer.tokenize(fix_word)
-    tokenizer.convert_tokens_to_ids(tokenized_fix_word[i])
+    tokens = tokenizer.tokenize(fix_word)
+    generated_token_ids = tokenizer.convert_tokens_to_ids(tokens)
 
     input_type_id = [0] * max_length
     input_mask = [1] * len(generated_token_ids)
@@ -79,8 +81,9 @@ def paraphrase(tokenizer, device, max_iter=10, length=50, max_length=128,
     input_mask = torch.tensor([input_mask], dtype=torch.long).to(device)
 
 
-    for j in range(length):
+    for j, _ in enumerate(tokens):
         # 文章のトークン１つをMASKに変換する
+        # ヘッダは除くから、+1から
         generated_token_ids[0, j + 1] = tokenizer.vocab["[MASK]"]
 
         # 予測、(all_encoder_layers, _)が返り値
@@ -90,7 +93,7 @@ def paraphrase(tokenizer, device, max_iter=10, length=50, max_length=128,
         sampled_token_id = torch.argmax(logits[j + 1])
 
         if sampled_token_id == generated_token_ids[0, j + 1]:
-            logits[j + 1] = tourch.min(logits[j + 1])
+            logits[j + 1] = torch.min(logits[j + 1])
             sampled_token_id = torch.argmax(logits[j + 1])
 
         generated_token_ids[0, j + 1] = sampled_token_id
@@ -98,8 +101,15 @@ def paraphrase(tokenizer, device, max_iter=10, length=50, max_length=128,
         # idから文字列に変換、結合
         sampled_sequence = [tokenizer.ids_to_tokens[token_id]
                             for token_id in generated_token_ids[0].cpu().numpy()]
-        sampled_sequence = "".join([token[2:] if token.startswith("##") else token
-                                    for token in sampled_sequence[1:length + 1]])
+        sampled_sequence = "".join(
+            [
+                token[2:] if token.startswith("##") else token
+                for token in list(filter(lambda x: x != '[PAD]', sampled_sequence))
+            ]
+        )
+
+        logger.info("sampled sequence: {}".format(sampled_sequence))
+    
 
 
 def main():
@@ -126,8 +136,7 @@ def main():
                                               tokenize_chinese_chars=False)
 
     # 言い換え
-    paraphrase(tokenizer, device, max_iter=args.max_iter,
-                length=args.seq_length, model=args.bert_model,
+    paraphrase(tokenizer, device, model=args.bert_model,
                 fix_word=args.fix_word, samples=args.samples)
 
 
