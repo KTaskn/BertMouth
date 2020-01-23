@@ -1,31 +1,19 @@
-#! /usr/bin/env python
-# -*- coding: utf-8 -*-
-import argparse
-import os
-import random
+
 import logging
-import random
-import datetime
+from pathlib import Path
+import argparse
 
-import torch
-import torch.nn.functional as F
-from torch.nn.modules.loss import CrossEntropyLoss
 import numpy as np
-from tqdm import tqdm, trange
-from transformers.tokenization_bert import BertTokenizer
-from transformers.optimization import AdamW, WarmupLinearSchedule
-from transformers import CONFIG_NAME, WEIGHTS_NAME
-from torch import optim
-from torch.utils.tensorboard import SummaryWriter
+import torch
+from pytorch_pretrained_bert import BertTokenizer, BertModel
+from pytorch_transformers import BertForMaskedLM
+from pyknp import Juman
 
-from model import BertMouth
-from data import make_dataloader
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def parse_argument():
     parser = argparse.ArgumentParser()
@@ -36,108 +24,106 @@ def parse_argument():
                         help="Bert pre-trained model selected in the list: bert-base-uncased, "
                         "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
                         "bert-base-multilingual-cased, bert-base-chinese.")
-    parser.add_argument("--max_seq_length", default=128, type=int,
-                        help="The maximum total input sequence length after WordPiece tokenization. Sequences "
-                             "longer than this will be truncated, and sequences shorter than this will be padded.")
     parser.add_argument("--no_cuda",
-                        action='store_true',
-                        help="Whether not to use CUDA when available.")
-    parser.add_argument('--seed',
-                        type=int,
-                        default=-1,
-                        help="A random seed for initialization.")
-    parser.add_argument("--samples", default=10, type=int,
-                        help="The number of generated texts.")
+                    action='store_true',
+                    help="Whether not to use CUDA when available.")
 
     args = parser.parse_args()
     return args
 
-def paraphrase(tokenizer, device, max_length=128,
-             model=None, fix_word=None, samples=1):
+class JumanTokenizer():
+    def __init__(self):
+        self.juman = Juman()
 
-    # モデルを読み込む、state_dictはパラメータを読み込む？
-    model_state_dict = torch.load(os.path.join(model, "pytorch_model.bin"),
-                                    map_location=device)
-    model = BertMouth.from_pretrained(model,
-                                        state_dict=model_state_dict,
-                                        num_labels=tokenizer.vocab_size)
-    # GPU/CPUにあわせる
-    model.to(device)
-
-    # 入力を分かち書き
-    tokens = tokenizer.tokenize(fix_word)
-    generated_token_ids = tokenizer.convert_tokens_to_ids(tokens)
-
-    input_type_id = [0] * max_length
-    input_mask = [1] * len(generated_token_ids)
-    while len(input_mask) < max_length:
-        generated_token_ids.append(0)
-        input_mask.append(0)
-
-    generated_token_ids = torch.tensor([generated_token_ids],
-                                        dtype=torch.long).to(device)
-    input_type_id = torch.tensor(
-        [input_type_id], dtype=torch.long).to(device)
-    input_mask = torch.tensor([input_mask], dtype=torch.long).to(device)
+    def tokenize(self, text):
+        # Jumanを用いて、日本語の文章を分かち書きする。
+        result = self.juman.analysis(text)
+        return [mrph.midasi for mrph in result.mrph_list()]
 
 
-    for j, _ in enumerate(tokens):
-        # 文章のトークン１つをMASKに変換する
-        # ヘッダは除くから、+1から
-        generated_token_ids[0, j + 1] = tokenizer.vocab["[MASK]"]
+class BertWithJumanModel():
+    def __init__(self, bert_path, vocab_file_name="vocab.txt", use_cuda=False):
+        # 日本語文章をBERTに食わせるためにJumanを読み込む
+        self.juman_tokenizer = JumanTokenizer()
+        # 事前学習済みのBERTモデルのMaskedLMタスクモデルを読み込む
+        self.model = BertForMaskedLM.from_pretrained(bert_path)
+        # 事前学習済みのBERTモデルのTokenizerを読み込む
+        self.bert_tokenizer = BertTokenizer(Path(bert_path) / vocab_file_name,
+                                            do_lower_case=False, do_basic_tokenize=False)
+        # CUDA-GPUを利用するかどうかのフラグ読み込み
+        self.use_cuda = use_cuda
 
-        # 予測、(all_encoder_layers, _)が返り値
-        logits = model(generated_token_ids, input_type_id, input_mask)[0]
+    def _preprocess_text(self, text):
+        # 事前処理、テキストの半角スペースは削除
+        return text.replace(" ", "")  # for Juman
 
-        # MASKにした箇所で最も確率が高いトークンを取得し、置き換える
-        sampled_token_id = torch.argmax(logits[j + 1])
+    def paraphrase(self, text):
+        # テキストの半角スペースを削除する
+        preprocessed_text = self._preprocess_text(text)
+        # 日本語のテキストを分かち書きし、トークンリストに変換する
+        tokens = self.juman_tokenizer.tokenize(preprocessed_text)
+        # トークンを半角スペースで結合しstrに変換する
+        bert_tokens = self.bert_tokenizer.tokenize(" ".join(tokens))
+        # テキストのサイズは128までなので、ヘッダ + トークン126個 + フッタを作成
+        # トークンをidに置換する
+        ids = self.bert_tokenizer.convert_tokens_to_ids(["[CLS]"] + bert_tokens[:126] + ["[SEP]"]) # max_seq_len-2
+        generated_token_ids = torch.tensor(ids).reshape(1, -1)
 
-        if sampled_token_id == generated_token_ids[0, j + 1]:
-            logits[j + 1] = torch.min(logits[j + 1])
-            sampled_token_id = torch.argmax(logits[j + 1])
+        if self.use_cuda:
+            # GPUの利用チェック、利用
+            generated_token_ids = generated_token_ids.to('cuda')
+            self.model.to('cuda')
 
-        generated_token_ids[0, j + 1] = sampled_token_id
+        # モデルを評価モードに変更
+        self.model.eval()
+        with torch.no_grad():
+            for i in range(10):
+                for j, _ in enumerate(tokens):
+                    # 文章のトークン１つをMASKに変換する
+                    # ヘッダは除くから、+1から
+                    masked_index = j + 1
 
-        # idから文字列に変換、結合
-        sampled_sequence = [tokenizer.ids_to_tokens[token_id]
-                            for token_id in generated_token_ids[0].cpu().numpy()]
-        sampled_sequence = "".join(
-            [
-                token[2:] if token.startswith("##") else token
-                for token in list(filter(lambda x: x != '[PAD]', sampled_sequence))
-            ]
-        )
+                    pre_token = generated_token_ids[0, masked_index].item()
 
-        logger.info("sampled sequence: {}".format(sampled_sequence))
+                    generated_token_ids[0, masked_index] = self.bert_tokenizer.vocab["[MASK]"]
+
+                    outputs = self.model(generated_token_ids)
+                    predictions = outputs[0]
+
+                    _, predicted_indexes = torch.topk(predictions[0, masked_index], k=5)
+                    predicted_tokens = self.bert_tokenizer.convert_ids_to_tokens(predicted_indexes.tolist())
+
+                    print(predicted_tokens)
+
+                    predict_token = predicted_indexes.tolist()[0]
+
+                    # if pre_token == predict_token:
+                    #     predict_token = predicted_indexes.tolist()[1]
+
+                    generated_token_ids[0, masked_index] = predict_token
+
+                    # idから文字列に変換、結合
+                    sampled_sequence = [self.bert_tokenizer.ids_to_tokens[token_id]
+                                        for token_id in generated_token_ids[0].cpu().numpy()]
+                    sampled_sequence = "".join(
+                        [
+                            token[2:] if token.startswith("##") else token
+                            for token in list(filter(lambda x: x != '[PAD]', sampled_sequence))
+                        ]
+                    )
+                    
+                    logger.info("sampled sequence: {}".format(sampled_sequence))
     
-
-
 def main():
     # 引数を処理する
     args = parse_argument()
 
-    # 乱数処理のシードをチェック
-    if args.seed is not -1:
-        # 各種の乱数処理のシードを固定化する
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+    bwjm = BertWithJumanModel(
+        bert_path=args.bert_model,
+        use_cuda=args.no_cuda == False
+    )
+    bwjm.paraphrase(args.fix_word)
 
-    # pytorchに利用するGPU/CPUを設定する
-    device = torch.device("cuda" if torch.cuda.is_available()
-                          and not args.no_cuda else "cpu")
-
-    if device != "cpu":
-        # GPUの乱数シードを設定する
-        torch.cuda.manual_seed_all(args.seed)
-
-    # 事前学習済みのBERTモデルのTokernizerを読み込む
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=False,
-                                              tokenize_chinese_chars=False)
-
-    # 言い換え
-    paraphrase(tokenizer, device, model=args.bert_model,
-                fix_word=args.fix_word, samples=args.samples)
 
 
 if __name__ == '__main__':
