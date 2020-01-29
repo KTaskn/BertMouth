@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 from pytorch_pretrained_bert import BertTokenizer, BertModel
+from pytorch_transformers import BertForMaskedLM
 from pyknp import Juman
 
 def parse_argument():
@@ -93,17 +94,22 @@ class BertWithJumanModel():
 
 
 class Generater:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, bert_path):
         self.tokenizer = tokenizer
         self.vocab_size = len(self.tokenizer.vocab)
 
+        # 事前学習済みのBERTモデルのMaskedLMタスクモデルを読み込む
+        self.model = BertForMaskedLM.from_pretrained(bert_path)
+
         # 除外するヘッダ等トークン
-        except_tokens = ["[MASK]", "[PAD]", "[UNK]", "[CLS]", "[SEP]"]
-        except_ids = [self.tokenizer.vocab[token] for token in except_tokens]
+        except_tokens = ["[MASK]", 
+        #"[PAD]",
+        "[UNK]", "[CLS]", "[SEP]"]
+        self.except_ids = [self.tokenizer.vocab[token] for token in except_tokens]
 
         # vocab_sizeのうち、except_ids以外は、利用する
         self.candidate_ids = [i for i in range(self.vocab_size)
-                        if i not in except_ids]
+                        if i not in self.except_ids]
 
     def initialization_text(self, length):
         init_tokens = []
@@ -142,7 +148,19 @@ class Generater:
     def mutation(self, tokens):
         l_tokens = tokens.numpy().reshape(-1).tolist()
         num = random.randint(1, len(l_tokens) - 2)
-        l_tokens[num] = random.choice(self.candidate_ids)
+        l_tokens[num] = self.tokenizer.vocab["[MASK]"]
+        
+        outputs = self.model(torch.tensor(l_tokens).reshape(1, -1))
+        predictions = outputs[0]
+        _, predicted_indexes = torch.topk(predictions[0, num], k=10)
+
+        predicted_indexes = list(set(predicted_indexes.tolist()) - set(self.except_ids))
+
+        predicted_tokens = self.tokenizer.convert_ids_to_tokens(predicted_indexes)
+        predict_token = random.choice(predicted_indexes)
+
+        l_tokens[num] = predict_token
+
         return torch.tensor(l_tokens).reshape(1, -1)
 
 
@@ -157,14 +175,16 @@ if __name__ == '__main__':
 
     l_tokens = []
     vecs_gen = []
-    epoch = 100
+    epoch = 1000
 
-    N = 10
-    NC = 5
+    N = 100
+    NC = 30
 
+    LENGTH = 20
+
+    gen = Generater(bwjm.bert_tokenizer, args.bert_path)
     for num in range(N):
-        gen = Generater(bwjm.bert_tokenizer)
-        tokens = gen.initialization_text(5)
+        tokens = gen.initialization_text(LENGTH)
         l_tokens.append(tokens)
 
     for i in range(epoch):
