@@ -43,7 +43,7 @@ class JumanTokenizer():
     def tanka_score_subsets(self, text):
         _count = [5, 7]
         score = 0
-        REWARD = 1
+        REWARD = 5
         PENALTY = -1
 
         for row in self.subset(self.remove_small(self.yomi(text))):
@@ -55,7 +55,7 @@ class JumanTokenizer():
 
     def tanka_score_flow(self, text):
         _count = [5, 12, 17, 24, 31]
-        REWARD = [5, 10, 15, 20, 25, 1000]
+        REWARD = [50, 100, 150, 200, 250, 1000]
 
         score = 0
         idx = 0
@@ -66,6 +66,8 @@ class JumanTokenizer():
             if len(subset) == _count[idx]:
                 score = REWARD[idx]
                 idx += 1
+                if _count[idx] == _count[-1]:
+                    break
             elif len(subset) < _count[idx]:
                 pass
             else:
@@ -102,7 +104,7 @@ class Generater:
 
         # 除外するヘッダ等トークン
         except_tokens = ["[MASK]", 
-        "[PAD]",
+        #"[PAD]",
         "[UNK]", "[CLS]", "[SEP]",
         "（", "）", "・", "／", "、", "。", "！", "？", "「", "」", "…", "’", "』", "『", "：", "※"
         ]
@@ -201,9 +203,10 @@ class Generater:
             
             outputs = self.model(torch.tensor(l_tokens).reshape(1, -1))
             predictions = outputs[0]
-            _, predicted_indexes = torch.topk(predictions[0, num], k=9)
+            _, predicted_indexes = torch.topk(predictions[0, num], k=10)
 
-            random_tokens = [random.choice(self.candidate_ids) for i in range(1)]
+            # random_tokens = [random.choice(self.candidate_ids) for i in range(1)]
+            random_tokens = []
 
             predicted_indexes = list(
                 set(predicted_indexes.tolist() + random_tokens) - set(self.except_ids)
@@ -225,18 +228,23 @@ if __name__ == '__main__':
     gen = Generater(args.bert_path)
 
     epoch = 100
-    N = 100
-    S = 20
+    N = 20
+    S = 5
 
     TOP = 0
 
-    l_tokens = [gen.initialization_text() for i in range(N)]
+    l_tokens = [gen.initialization_text(14) for i in range(N)]
 
     for idx in range(epoch):
         selected = gen.select(l_tokens, size=S)
 
         pprint(list(map(
             gen.tokens2text,
+            selected[:5]
+        )))
+
+        pprint(list(map(
+            lambda x: len(''.join(gen.juman_tokenizer.yomi(gen.tokens2text(x)))),
             selected[:5]
         )))
 
@@ -247,7 +255,7 @@ if __name__ == '__main__':
                 gen.mutation(gen.crossover(
                     random.choice(selected),
                     random.choice(selected)
-                ), random.choice([1, 1, 1, 2, 3]))
+                ), random.choice([1, 1, 1, 1, 7, 7]))
             )
 
         
