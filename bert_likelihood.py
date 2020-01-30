@@ -11,8 +11,6 @@ from pyknp import Juman
 
 def parse_argument():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--text", default=None, type=str, required=True,
-                        help="text")
     parser.add_argument("--bert_path", default=None, type=str,
                         help="bert path")
 
@@ -28,6 +26,43 @@ class JumanTokenizer():
         # Jumanを用いて、日本語の文章を分かち書きする。
         result = self.juman.analysis(text)
         return [mrph.midasi for mrph in result.mrph_list()]
+
+    def yomi(self, text):
+        return list(map(lambda x: x.yomi, self.juman.analysis(text).mrph_list()))
+
+    def _remove_small(self, token):
+        l_small = ['ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'ゃ', 'ゅ', 'ょ', 'っ']
+        for small in l_small:
+            token = token.replace(small, '')
+        return token
+
+
+    def remove_small(self, tokens):
+        return list(map(self._remove_small, tokens))
+
+    def tanka_score(self, text):
+        _count = [5, 7]
+        score = 0
+        REWARD = 1
+        PENALTY = -1
+
+        for row in self.subset(self.remove_small(self.yomi(text))):
+            if len(''.join(row)) in _count:
+                score += REWARD
+            else:
+                score += PENALTY
+        return score
+
+    def subset(self, tokens):
+        subsets = []
+
+        length = len(tokens)
+        for idx_a in range(length):
+            for idx_b in range(idx_a + 1, length + 1):
+                subsets.append(tokens[idx_a:idx_b])
+
+        return subsets
+
 
 
 class Generater:
@@ -47,8 +82,10 @@ class Generater:
 
         # 除外するヘッダ等トークン
         except_tokens = ["[MASK]", 
-        #"[PAD]",
-        "[UNK]", "[CLS]", "[SEP]"]
+        "[PAD]",
+        "[UNK]", "[CLS]", "[SEP]",
+        "（", "）", "・", "／", "、", "。", "！", "？", "「", "」", "…", "’", "』", "『", "：", "※"
+        ]
         self.except_ids = [self.bert_tokenizer.vocab[token] for token in except_tokens]
 
         # vocab_sizeのうち、except_ids以外は、利用する
@@ -73,6 +110,18 @@ class Generater:
         generated_token_ids = torch.tensor(ids).reshape(1, -1)
         return generated_token_ids
 
+    def tokens2text(self, tokens):
+        sampled_sequence = [self.bert_tokenizer.ids_to_tokens[token_id]
+                                        for token_id in tokens[0].cpu().numpy()]
+        sampled_sequence = "".join(
+            [
+                token[2:] if token.startswith("##") else token
+                for token in list(filter(lambda x: x != '[PAD]' and x != '[CLS]' and x != '[SEP]', sampled_sequence))
+            ]
+        )
+        return sampled_sequence
+
+
     def likelihood(self, tokens):
         outputs = self.model(tokens)
         predictions = outputs[0]
@@ -82,7 +131,7 @@ class Generater:
             score_sum += scores[idx]
         return score_sum
 
-    def initialization_text(self, length):
+    def initialization_text(self, length=10):
         init_tokens = []
         # ヘッダ
         init_tokens.append(self.bert_tokenizer.vocab["[CLS]"])
@@ -94,15 +143,22 @@ class Generater:
 
         return torch.tensor(init_tokens).reshape(1, -1)
 
-    def select(self, vec_target, vecs_gen, size=5):
-        ret = []
-        for vec in vecs_gen:
-            ret.append(np.linalg.norm(vec_target - vec))
-        print(ret)
-        return list(map(
-            lambda x: x[1],
-            sorted(tuple(zip(ret, range(len(vecs_gen)))), key=lambda x: x[0])[:size]
+    def scoring(self, tokens):
+        return self.likelihood(tokens) + self.juman_tokenizer.tanka_score(self.tokens2text(tokens))
+
+    def select(self, l_tokens, size=5):
+        scores = list(map(self.scoring, l_tokens))
+        print(sorted(scores, reverse=True)[:3])
+        selected = list(map(
+            lambda x: x[0],
+            sorted(
+                list(zip(l_tokens, scores)), 
+                key=lambda x: x[1],
+                reverse=True
+            )
         ))
+
+        return selected
 
     def crossover(self, tokens_0, tokens_1):
         l_tokens_0 = tokens_0.numpy().reshape(-1).tolist()
@@ -116,21 +172,23 @@ class Generater:
 
         return torch.tensor(l_tokens_0).reshape(1, -1)
 
-    def mutation(self, tokens):
+    def mutation(self, tokens, N=3):
         l_tokens = tokens.numpy().reshape(-1).tolist()
-        num = random.randint(1, len(l_tokens) - 2)
-        l_tokens[num] = self.bert_tokenizer.vocab["[MASK]"]
-        
-        outputs = self.model(torch.tensor(l_tokens).reshape(1, -1))
-        predictions = outputs[0]
-        _, predicted_indexes = torch.topk(predictions[0, num], k=10)
 
-        predicted_indexes = list(set(predicted_indexes.tolist()) - set(self.except_ids))
+        for num in range(N):
+            num = random.randint(1, len(l_tokens) - 2)
+            l_tokens[num] = self.bert_tokenizer.vocab["[MASK]"]
+            
+            outputs = self.model(torch.tensor(l_tokens).reshape(1, -1))
+            predictions = outputs[0]
+            _, predicted_indexes = torch.topk(predictions[0, num], k=10)
 
-        predicted_tokens = self.bert_tokenizer.convert_ids_to_tokens(predicted_indexes)
-        predict_token = random.choice(predicted_indexes)
+            predicted_indexes = list(set(predicted_indexes.tolist()) - set(self.except_ids))
 
-        l_tokens[num] = predict_token
+            predicted_tokens = self.bert_tokenizer.convert_ids_to_tokens(predicted_indexes)
+            predict_token = random.choice(predicted_indexes)
+
+            l_tokens[num] = predict_token
 
         return torch.tensor(l_tokens).reshape(1, -1)
 
@@ -138,8 +196,35 @@ class Generater:
 
 if __name__ == '__main__':
     import pandas as pd
+    from pprint import pprint
     args = parse_argument()
     gen = Generater(args.bert_path)
 
-    tokens = gen.text2tokens(args.text)
-    print(gen.likelihood(tokens))
+    epoch = 100
+    N = 100
+    S = 20
+
+    TOP = 5
+
+    l_tokens = [gen.initialization_text() for i in range(N)]
+
+    for idx in range(epoch):
+        selected = gen.select(l_tokens, size=5)
+
+        pprint(list(map(
+            gen.tokens2text,
+            selected[:5]
+        )))
+
+        l_tokens = selected[:TOP]
+
+        for n in range(N - TOP):
+            l_tokens.append(
+                gen.mutation(gen.crossover(
+                    random.choice(selected),
+                    random.choice(selected)
+                ), random.choice([1, 1, 1, 2, 3]))
+            )
+
+        
+
