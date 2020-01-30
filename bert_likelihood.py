@@ -40,7 +40,7 @@ class JumanTokenizer():
     def remove_small(self, tokens):
         return list(map(self._remove_small, tokens))
 
-    def tanka_score(self, text):
+    def tanka_score_subsets(self, text):
         _count = [5, 7]
         score = 0
         REWARD = 1
@@ -51,6 +51,26 @@ class JumanTokenizer():
                 score += REWARD
             else:
                 score += PENALTY
+        return score
+
+    def tanka_score_flow(self, text):
+        _count = [5, 12, 17, 24, 31]
+        REWARD = [5, 10, 15, 20, 25, 1000]
+
+        score = 0
+        idx = 0
+
+        subset = ''
+        for row in self.remove_small(self.yomi(text)):
+            subset += row
+            if len(subset) == _count[idx]:
+                score = REWARD[idx]
+                idx += 1
+            elif len(subset) < _count[idx]:
+                pass
+            else:
+                break
+            
         return score
 
     def subset(self, tokens):
@@ -144,7 +164,7 @@ class Generater:
         return torch.tensor(init_tokens).reshape(1, -1)
 
     def scoring(self, tokens):
-        return self.likelihood(tokens) + self.juman_tokenizer.tanka_score(self.tokens2text(tokens))
+        return self.likelihood(tokens) + self.juman_tokenizer.tanka_score_subsets(self.tokens2text(tokens)) + self.juman_tokenizer.tanka_score_flow(self.tokens2text(tokens))
 
     def select(self, l_tokens, size=5):
         scores = list(map(self.scoring, l_tokens))
@@ -181,9 +201,13 @@ class Generater:
             
             outputs = self.model(torch.tensor(l_tokens).reshape(1, -1))
             predictions = outputs[0]
-            _, predicted_indexes = torch.topk(predictions[0, num], k=10)
+            _, predicted_indexes = torch.topk(predictions[0, num], k=9)
 
-            predicted_indexes = list(set(predicted_indexes.tolist()) - set(self.except_ids))
+            random_tokens = [random.choice(self.candidate_ids) for i in range(1)]
+
+            predicted_indexes = list(
+                set(predicted_indexes.tolist() + random_tokens) - set(self.except_ids)
+            )
 
             predicted_tokens = self.bert_tokenizer.convert_ids_to_tokens(predicted_indexes)
             predict_token = random.choice(predicted_indexes)
@@ -204,12 +228,12 @@ if __name__ == '__main__':
     N = 100
     S = 20
 
-    TOP = 5
+    TOP = 0
 
     l_tokens = [gen.initialization_text() for i in range(N)]
 
     for idx in range(epoch):
-        selected = gen.select(l_tokens, size=5)
+        selected = gen.select(l_tokens, size=S)
 
         pprint(list(map(
             gen.tokens2text,
